@@ -1,0 +1,35 @@
+# User-generated course files and browser data must never be committed.
+字幕输出/
+exports/
+outputs/
+work/
+*.txt
+*.json
+*.html
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.log
+*.db
+*.sqlite*
+*.har
+*.pem
+*.key
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*browser-profile*/
+course-subtitle-browser-*/
+DevToolsActivePort
+Cookies
+Login Data
+History
+Local State
+Preferences
+.DS_Store
+Thumbs.db
