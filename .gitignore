@@ -1,5 +1,7 @@
 # User-generated course files and browser data must never be committed.
 字幕输出/
+PPT输出/
+提取结果/
 exports/
 outputs/
 work/
@@ -25,6 +27,9 @@ __pycache__/
 venv/
 *browser-profile*/
 course-subtitle-browser-*/
+course-ppt-browser-*/
+course-exporter-browser-*/
+*.part
 DevToolsActivePort
 Cookies
 Login Data
