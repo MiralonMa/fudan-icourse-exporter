@@ -12,6 +12,7 @@ import tempfile
 
 import extract_ppt as ppt
 import extract_subtitles as subtitles
+import ppt_filter as filtering
 
 
 LABELS = {'subtitles': '字幕', 'ppt': 'PPT'}
@@ -86,11 +87,13 @@ def run_pending(target, pending, options):
                         raise subtitles.ExportError('录播页已切换，请回到本次选择的课程后重试。')
                     path, report = ppt.export_ppt(cdp, data, options.output_dir / 'PPT',
                         min_width=options.min_width, min_height=options.min_height,
-                        retries=options.retries, allow_partial=options.allow_partial)
+                        retries=options.retries, allow_partial=options.allow_partial,
+                        filter_mode=options.ppt_filter, start_time=options.start_time, end_time=options.end_time)
                 if report['missing_orders']:
                     print(f"PPT 部分完成：{len(report['completed'])}/{report['source_count']} 张；缺页见清单。")
                 else:
-                    print(f"PPT 完成：{report['source_count']} 张原图及 PDF。")
+                    included = len(report.get('pdf_included_orders', range(report['source_count'])))
+                    print(f"PPT 完成：{report['source_count']} 张原图，PDF 保留 {included} 张。")
             succeeded[kind] = path
             print(f'保存位置：{path}', flush=True)
         except (subtitles.ExportError, OSError, ValueError) as error:
@@ -111,6 +114,12 @@ def build_parser():
     parser.add_argument('--min-width', type=int, default=800, help='PPT 原图最小宽度，默认 800 像素')
     parser.add_argument('--min-height', type=int, default=450, help='PPT 原图最小高度，默认 450 像素')
     parser.add_argument('--allow-partial', action='store_true', help='明确允许输出标为“部分”的缺页 PPT PDF')
+    parser.add_argument('--ppt-filter', choices=['auto', 'off'], default='auto', help='自动筛除头尾密集重复画面；off 关闭自动筛选')
+    parser.add_argument('--start-time', help='PPT 手动开始时间 HH:MM:SS')
+    parser.add_argument('--end-time', help='PPT 手动结束时间 HH:MM:SS')
+    parser.add_argument('--filter-existing', type=Path, help='离线重建已下载 PPT；指定含 PPT清单.json 和 images 的文件夹，不需登录')
+    parser.add_argument('--subtitles-file', type=Path, help='离线筛选时可选的已导出字幕 TXT／JSON')
+    parser.add_argument('--filtered-output', type=Path, help='离线筛选 PDF 的另存位置，默认保存到原下载目录')
     return parser
 
 
@@ -119,12 +128,21 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     options = build_parser().parse_args(argv)
+    if options.filter_existing:
+        result, report = filtering.rebuild_existing(options.filter_existing,
+            output=options.filtered_output, browser_path=options.browser,
+            subtitles_file=options.subtitles_file, mode=options.ppt_filter,
+            start=options.start_time, end=options.end_time, allow_partial=options.allow_partial)
+        print(f'精简 PDF：{result}\n保留 {len(report["included_orders"])} 张，筛除 {len(report["excluded_orders"])} 张。原 PDF 和原图未覆盖。')
+        return 0
     selected = choose_mode(options.extract)
     if not selected:
         print('已取消。')
         return 0
     if 'ppt' in selected and (not 0 <= options.retries <= 5 or min(options.min_width, options.min_height) < 1):
         raise subtitles.ExportError('PPT 重试次数须在 0 到 5 之间，最小宽高须为正数。')
+    if 'ppt' in selected:
+        filtering.validate_window(options.start_time, options.end_time)
     options.output_dir = options.output_dir.expanduser().resolve()
     requested = (options.url or input('请输入课程录播网址：')).strip()
     subtitles.validate_page_url(requested)

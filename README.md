@@ -1,10 +1,10 @@
-# 复旦 icourse 课程资料提取工具
+# 复旦 icourse 课程资料提取与 PPT 精简工具
 
 **本项目仅适用于复旦大学 icourse 网站（[icourse.fudan.edu.cn](https://icourse.fudan.edu.cn)），不适用于其他学校或其他录播平台。**
 
 启动后选择“仅字幕”“仅 PPT”或“两者都提取”，输入录播网址，在独立浏览器窗口中自行登录一次，即可导出字幕 TXT、清晰 PPT 原图及 PDF。不提取音频或视频，不自动纠正语音识别文字。
 
-统一入口为 `extract_course.py`，Windows 用户可直接双击 `启动课程提取.cmd`。支持 PPT 断点续传、缺页检查，以及部分任务失败后只重试未完成内容。
+统一入口为 `extract_course.py`，Windows 用户可直接双击 `启动课程提取.cmd`。支持 PPT 断点续传、缺页检查、头尾重复画面筛选，以及部分任务失败后只重试未完成内容。仓库名称为 `fudan-icourse-exporter`，同时涵盖字幕和 PPT 的导出与整理。
 
 ## 环境要求
 
@@ -47,7 +47,38 @@
 
 **默认必须全部图片成功后才生成完整 PDF。** 遇到 3 张读取失败时会停止并保留已下载图片。恢复校园网后，以相同输出目录重新登录运行即可续传；缓存会校验 SHA-256。退出、取消或重试不会删除已下载的原图。
 
-若明确需要缺页版本，可在命令行添加 `--allow-partial`；文件名会标明“部分 X 张／共 Y 张”，清单列出所有缺页。录播截图可能含课间画面或重复页面，默认按网站原列表保留，不自动删重。
+若明确需要缺页版本，可在命令行添加 `--allow-partial`；文件名会标明“部分 X 张／共 Y 张”，清单列出所有缺页。原图始终按网站原列表缓存；PDF 默认保守筛选头尾密集重复画面，中间页面不自动删重。
+
+### 筛选头尾默认画面
+
+**正常提取会先筛选页面，再直接生成筛选后的 PDF，不会先输出一份未筛选 PDF。** 默认开启自动筛选；如果没有足够证据筛除页面，PDF 会保留全部原页。`--ppt-filter off` 可关闭自动筛选。原图缓存用于续传和恢复，仍按原始清单完整保存。
+
+默认 `--ppt-filter auto`：当头尾属于同一画面组、均连续密集重复截图，且中间确有不同画面的课程段时，从 PDF 中移除这两端的重复组。页数少、画面不匹配或证据不足时保留原页。不确定的浏览器操作、桌面与 PPT 编辑画面也会保留。
+
+这是一种重复画面启发式筛选，不是 OCR 或语义识别；密集重复的课程封面也可能命中。请核对清单中的原序号与删除理由；原图不删除，可用 `--ppt-filter off` 恢复全部页面。原 PDF 不会被离线筛选覆盖，已下载缓存仍用于续传。
+
+字幕首尾可能包含课前交流或课后答疑，不能直接当作讲课起止。程序只读取字幕时间和字数作为核对证据，在筛选清单逐页记录显示区间、字幕条数和字数；不会因为页面仍有字幕就把重复主页保留，也不会因为没有字幕就删除真实课件。
+
+若已核对课程的确切起止，可加 `--start-time HH:MM:SS --end-time HH:MM:SS`。程序按页面实际显示区间判断重叠，保留开始时间之前出现、但在开始时间仍显示的那一页。
+
+```powershell
+python extract_course.py --extract both
+python extract_course.py --extract ppt --ppt-filter off
+```
+
+### 已下载课程无需重下
+
+指定包含 `PPT清单.json` 和 `images/` 的课程下载目录，即可在本机重建 PDF，无需登录或重新下载：
+
+```powershell
+python extract_course.py --filter-existing ".\提取结果\PPT\课程标题_清单标识"
+python extract_course.py --filter-existing ".\课程下载目录" --subtitles-file ".\课程字幕.txt"
+python extract_course.py --filter-existing ".\课程下载目录" --start-time "00:05:00" --end-time "01:40:00"
+```
+
+以上目录、文件名与时间为示例，需换成自己的课程数据。`--subtitles-file` 可选，支持本工具导出的 TXT 或 JSON；`--filtered-output` 可指定另存 PDF 的位置。该流程会先校验原图哈希，使用临时无头 Edge／Chrome 解析本机图片，不向课程网站发出图片下载请求。仍只需 Python 标准库及现有浏览器。
+
+另存的 PDF 旁会生成 `.筛选报告.json`，包含保留／筛除序号、逐页依据和字幕时间证据。正常提取时，相同信息记录在 `PPT清单.json` 的 `filter` 字段。筛选只减少 PDF 中的页面，不自动清理原图缓存或旧 PDF；核对后可自行清理旧文件。
 
 ```powershell
 python extract_course.py --extract ppt --url "https://icourse.fudan.edu.cn/livingroom?course_id=0&sub_id=0&tenant_code=0"
@@ -76,6 +107,11 @@ python extract_course.py --extract subtitles
 | `--output-dir` | 指定本机保存根目录，其下自动分为字幕和 PPT 文件夹 |
 | `--browser` | 指定 Edge／Chrome 可执行文件路径 |
 | `--json` | 额外保存结构化字幕清单 |
+| `--ppt-filter` | `auto` 自动筛选头尾重复画面，`off` 关闭自动筛选 |
+| `--start-time` / `--end-time` | 可选的 PPT 手动时间窗；独立于自动筛选开关 |
+| `--filter-existing` | 从已有下载目录离线重建 PDF，跳过登录和选择菜单 |
+| `--subtitles-file` | 离线筛选时可选的字幕 TXT／JSON |
+| `--filtered-output` | 离线筛选 PDF 的另存路径 |
 | `--help` | 查看帮助 |
 
 TXT 使用 UTF-8（含 BOM），保留原文、重复语句、英文片段和识别错误。例如，以下为合成示例：
@@ -122,7 +158,7 @@ python -m unittest discover -s tests -v
 
 集成测试在临时目录生成 2,903 条合成字幕，使用独立无头浏览器逐条比对。它不访问校园网，不代表已验证登录后的在线整流程。
 
-PPT 测试使用合成 JPEG 与本机 HTTP 页面，验证原图获取、字节完整性、PDF 结构、断点续传和缺页处理。统一入口还测试三种选择、共用一个浏览器、失败后仅重试剩余内容，以及一次运行同时生成字幕和 PDF。测试不代替校园网登录后的实际使用验证。
+PPT 测试使用合成 JPEG 与本机 HTTP 页面，验证原图获取、字节完整性、PDF 结构、断点续传和缺页处理。统一入口还测试三种选择、共用一个浏览器、失败后仅重试剩余内容，以及一次运行同时生成字幕和 PDF。筛选测试覆盖密集重复头尾、中间重复页保留、长时间显示的正常课件、时间窗重叠、字幕证据及已有文件不覆盖。测试不代替校园网登录后的实际使用验证。
 
 ## 常见问题
 

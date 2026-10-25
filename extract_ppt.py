@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
+import ppt_filter as filtering
 
 from extract_subtitles import (CDP, ExportError, choose_course, find_browser,
                                launch_browser, list_pages, safe_name,
@@ -37,7 +38,11 @@ SLIDES_JS = r"""(() => {
     .map(entry => entry.name).filter(url => /\/ppt\/.*\/\d+\.jpe?g(?:\?|$)/i.test(url));
   const total = Number(document.querySelector('.pptSlider')?.getAttribute('aria-valuemax') ||
     document.querySelector('.ppt_page_con')?.textContent.split('/')[1] || 0);
-  return {title: document.title, url: location.href, total, rows, originalResources};
+  const subtitleTimeline = Array.from(document.querySelectorAll('.trans-item')).map(e => ({
+    time: e.previousElementSibling?.classList.contains('item-time') ? e.previousElementSibling.textContent.trim() : '',
+    chars: (e.querySelector('.item-origin')?.textContent || '').trim().length
+  }));
+  return {title: document.title, url: location.href, total, rows, originalResources, subtitleTimeline};
 })()"""
 
 
@@ -246,7 +251,9 @@ def write_pdf(path, title, rows, image_dir, total):
     return path
 
 
-def export_ppt(cdp, data, output_dir, *, min_width=800, min_height=450, retries=2, allow_partial=False):
+def export_ppt(cdp, data, output_dir, *, min_width=800, min_height=450, retries=2, allow_partial=False,
+               filter_mode='auto', start_time=None, end_time=None):
+    filtering.validate_window(start_time, end_time)
     rows = prepare_slides(data)
     clean_rows = [{'order': row['order'], 'time': row['time'],
                    'original': asset_identity(row['original'])} for row in rows]
@@ -329,7 +336,17 @@ def export_ppt(cdp, data, output_dir, *, min_width=800, min_height=450, retries=
     if not completed:
         raise ExportError('没有成功保存任何原图，未生成 PDF。')
     selected = [row for row in rows if row['order'] in completed]
+    print('正在核对头尾重复画面与时间轴…', flush=True)
+    selected, filter_report = filtering.filter_local_rows(selected, images, connection=cdp,
+        subtitle_rows=data.get('subtitleTimeline', []), mode=filter_mode, start=start_time, end=end_time)
+    report['filter'] = filter_report
+    report['pdf_included_orders'] = [row['order'] for row in selected]
+    report['filtered_out_orders'] = filter_report['excluded_orders']
+    removed = len(filter_report['excluded_orders'])
     suffix = f'_PPT_部分{len(selected)}张_共{len(rows)}张' if report['missing_orders'] else f'_PPT_完整{len(rows)}张'
+    if removed:
+        suffix = f'_PPT_{"部分精简" if report["missing_orders"] else "精简"}{len(selected)}张_原{len(rows)}张'
+    print(f'PDF 保留 {len(selected)} 张，筛除 {removed} 张；原图缓存保持完整。', flush=True)
     path = unique_path(folder, safe_name(data['title']) + suffix, '.pdf')
     write_pdf(path, data['title'] + suffix, selected, images, len(rows))
     report['pdf_file'] = path.name
@@ -349,7 +366,11 @@ def main(argv=None):
     parser.add_argument('--min-width', type=int, default=800, help='原图最小宽度，默认 800 像素')
     parser.add_argument('--min-height', type=int, default=450, help='原图最小高度，默认 450 像素')
     parser.add_argument('--allow-partial', action='store_true', help='显式允许输出标为“部分”的缺页 PDF')
+    parser.add_argument('--ppt-filter', choices=['auto', 'off'], default='auto', help='默认筛除头尾密集重复画面；off 保留全部画面')
+    parser.add_argument('--start-time', help='PPT 手动开始时间 HH:MM:SS，保留跨越开始点的页面')
+    parser.add_argument('--end-time', help='PPT 手动结束时间 HH:MM:SS')
     args = parser.parse_args(argv)
+    filtering.validate_window(args.start_time, args.end_time)
     if args.retries < 0 or args.retries > 5 or min(args.min_width, args.min_height) < 1:
         raise ExportError('重试次数须在 0 到 5 之间，最小宽高须为正数。')
     requested = (args.url or input('请输入课程录播网址：')).strip()
@@ -375,8 +396,9 @@ def main(argv=None):
                     data = evaluate(cdp, SLIDES_JS)
                     result, report = export_ppt(cdp, data, args.output_dir,
                         min_width=args.min_width, min_height=args.min_height,
-                        retries=args.retries, allow_partial=args.allow_partial)
-                print(f'\n导出完成：{result}\n原图：{len(report["completed"])}/{report["source_count"]} 张。PDF 内保留原图像素及原序号、时间戳。')
+                        retries=args.retries, allow_partial=args.allow_partial,
+                        filter_mode=args.ppt_filter, start_time=args.start_time, end_time=args.end_time)
+                print(f'\n导出完成：{result}\n原图：{len(report["completed"])}/{report["source_count"]} 张；PDF：{len(report["pdf_included_orders"])} 张。PDF 内保留原图像素及原序号、时间戳。')
                 break
             except (ExportError, OSError, ValueError) as error:
                 print(f'\n提取未完成：{error}')
