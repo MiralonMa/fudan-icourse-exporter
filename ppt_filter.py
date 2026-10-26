@@ -1,8 +1,9 @@
-"""Conservative local filtering of repetitive opening/closing PPT captures.
+"""Local filtering of Fudan recording-guide pages anywhere in the timeline.
 
-No OCR, network service or Python image package is required. A browser decodes
-the local JPEGs into small visual descriptors; decisions use image similarity,
-capture cadence and displayed time intervals. Subtitle timestamps are recorded
+No network service or Python image package is required. A browser decodes
+local JPEGs into small visual descriptors; Windows' installed OCR confirms
+recording-guide templates before matching them throughout the course.
+Subtitle timestamps are recorded
 as corroborating evidence, never treated as a reliable lecture start/end alone.
 """
 from __future__ import annotations
@@ -19,6 +20,10 @@ import subprocess
 import tempfile
 
 from extract_subtitles import CDP, ExportError, find_browser, launch_browser
+from local_ocr import read_image_text
+
+
+DEFAULT_DISTANCE = .035
 
 
 def seconds(value):
@@ -75,13 +80,10 @@ def local_image_browser(browser_path=None):
             'about:blank', headless=True)
         with CDP(browser_ws) as connection:
             target = connection.call('Target.createTarget', {'url': 'about:blank'})
-        # The JSON listing is loopback-only, like the existing extraction tools.
-        from extract_subtitles import list_pages
-        pages = list_pages(endpoint)
-        page = next((item for item in pages if item.get('id') == target['targetId']), None)
-        if page is None:
-            raise ExportError('无法建立本机图片分析页面。')
-        with CDP(page['webSocketDebuggerUrl']) as connection:
+        # The target was created by this browser; use its loopback endpoint
+        # directly, without racing the HTTP /json/list discovery endpoint.
+        page_ws = endpoint.replace('http://', 'ws://', 1) + '/devtools/page/' + target['targetId']
+        with CDP(page_ws) as connection:
             yield connection
     finally:
         if browser_ws:
@@ -138,7 +140,49 @@ def distance(first, second):
     return sum(abs(a-b) for a, b in zip(first, second)) / (255 * len(first))
 
 
-def filter_plan(rows, descriptor, *, subtitle_rows=None, mode='auto', start=None, end=None):
+def is_default_page_text(text):
+    """Require several independent recording-guide markers, never one keyword."""
+    compact = re.sub(r'\s+', '', text).casefold()
+    recording = '录制' in compact and ('演示' in compact or '录屏' in compact)
+    instructions = any(word in compact for word in ('视频获取', '录制效果', '教室分布'))
+    identity = any(word in compact for word in (
+        '本科课程评教', '智慧教学资源平台', '录播指南',
+        'cfd.fudan.edu', 'icourse.fudan.edu', 'ce.fudan.edu'))
+    return recording and instructions and identity
+
+
+def default_page_references(rows, descriptor, read_text):
+    """OCR representatives of visual groups, including singleton groups.
+
+    Repetition/cadence alone does not establish that a page is uninformative.
+    A normal slide, browser demonstration, or repeated cover must not become a
+    removal template just because the camera captured it many times.
+    """
+    representatives = []
+    for row in rows:
+        pixels = descriptor(row)
+        if not any(distance(pixels, descriptor(item)) <= DEFAULT_DISTANCE
+                   for item in representatives):
+            representatives.append(row)
+    try:
+        texts = read_text(representatives)
+    except OSError:
+        return [], {'status': 'unavailable', 'visual_groups': len(representatives),
+                    'reference_orders': []}
+    if len(texts) != len(representatives):
+        raise OSError('本机文字识别结果数量异常。')
+    references = [row['order'] for row, text in zip(representatives, texts)
+                  if isinstance(text, str) and is_default_page_text(text)]
+    failed = sum(text is None for text in texts)
+    return references, {'status': 'partial' if failed else 'complete',
+                        'visual_groups': len(representatives),
+                        'ocr_failed_groups': failed,
+                        'reference_orders': references,
+                        'distance_threshold': DEFAULT_DISTANCE}
+
+
+def filter_plan(rows, descriptor, *, subtitle_rows=None, mode='auto', start=None, end=None,
+                default_reference_orders=(), detection=None):
     if mode not in ('auto', 'off'):
         raise ExportError('未知 PPT 筛选模式。')
     lower, upper = validate_window(start, end)
@@ -150,51 +194,23 @@ def filter_plan(rows, descriptor, *, subtitle_rows=None, mode='auto', start=None
     excluded = {}
     notes = []
     automatic = []
-    # Only trim a shared visual family at BOTH recording edges, captured in
-    # dense repeated bursts. A long-held first/last teaching slide alone cannot
-    # qualify. Ambiguous UI, middle-of-class pages and ordinary repeat slides stay.
-    if mode == 'auto' and len(rows) >= 12 and stamps[-1] - stamps[0] >= 180:
-        first, last = descriptor(rows[0]), descriptor(rows[-1])
-        if distance(first, last) <= .035:
-            limit = min(600, (stamps[-1] - stamps[0]) * .15)
-
-            def matches(index):
-                pixels = descriptor(rows[index])
-                return min(distance(pixels, first), distance(pixels, last)) <= .035
-
-            head = []
-            for index in range(len(rows)):
-                if stamps[index] - stamps[0] > limit or not matches(index): break
-                head.append(index)
-            tail = []
-            for index in range(len(rows)-1, -1, -1):
-                if stamps[-1] - stamps[index] > limit or not matches(index): break
-                tail.append(index)
-            tail.reverse()
-
-            def dense(indices):
-                if len(indices) < 4 or stamps[indices[-1]] - stamps[indices[0]] < 15:
-                    return False
-                gaps = [stamps[b] - stamps[a] for a, b in zip(indices, indices[1:])]
-                return all(0 < gap <= 15 for gap in gaps)
-
-            eligible = (dense(head) and dense(tail) and tail[0]-head[-1] > 3
-                    and stamps[tail[0]] - stamps[head[-1]] >= 120
-                    and len(head) + len(tail) <= len(rows) * .8)
-            if eligible:
-                left, right = head[-1]+1, tail[0]-1
-                samples = {left, (left+right)//2, right}
-                eligible = sum(not matches(index) for index in samples) >= 2
-            if eligible:
-                automatic = head + tail
-                for index in automatic:
-                    excluded[index] = '头尾相同画面，连续密集重复截图'
-            else:
-                notes.append('头尾重复证据不足，未按画面自动删除。')
+    matched = {}
+    if mode == 'auto':
+        orders = set(default_reference_orders)
+        references = [row for row in rows if row['order'] in orders]
+        if not references:
+            notes.append('未确认录播默认页面，保留所有未确认页面；不会仅凭重复或无字幕删页。')
         else:
-            notes.append('头尾画面不属于同一视觉组，未自动裁剪。')
-    elif mode == 'auto':
-        notes.append('页数或录播跨度不足，未自动裁剪。')
+            for index, row in enumerate(rows):
+                candidates = [(distance(descriptor(row), descriptor(reference)), reference['order'])
+                              for reference in references]
+                score, reference = min(candidates)
+                if score <= DEFAULT_DISTANCE:
+                    automatic.append(index)
+                    excluded[index] = '匹配本机文字识别确认的录播默认页面（含课间）'
+                    matched[index] = {'reference_order': reference, 'distance': round(score, 6)}
+        if detection and detection.get('status') in ('unavailable', 'partial'):
+            notes.append('部分或全部本机文字识别不可用；无法确认的画面已保留。')
     if not timeline:
         notes.append('未取得字幕时间轴；筛选仅使用画面与截图时间。')
     evidence = []
@@ -215,14 +231,18 @@ def filter_plan(rows, descriptor, *, subtitle_rows=None, mode='auto', start=None
                 'subtitle_chars': sum(item[1] for item in timeline[begin_sub:end_sub]),
                 'keep': index not in excluded,
                 'reason': excluded.get(index, '保留：未确认属于无信息重复页')}
+        if index in matched:
+            info['default_page_match'] = matched[index]
         evidence.append(info)
     selected = [row for index, row in enumerate(rows) if index not in excluded]
     if not selected:
-        raise ExportError('筛选结果没有保留任何页面，请检查手动时间窗。')
-    report = {'version': 1, 'mode': mode, 'start': start, 'end': end,
+        raise ExportError('筛选后没有课程页面；未生成空 PDF。请检查时间窗，或用 --ppt-filter off 保留全部原页。')
+    report = {'version': 2, 'mode': mode, 'start': start, 'end': end,
               'source_count': len(rows), 'included_orders': [row['order'] for row in selected],
               'excluded_orders': [row['order'] for index, row in enumerate(rows) if index in excluded],
               'automatic_excluded_count': len(automatic), 'pages': evidence, 'notes': notes,
+              'default_page_detection': detection or {'status': 'not_run',
+                  'reference_orders': list(default_reference_orders)},
               'subtitle_timeline': {'count': len(timeline),
                   'first_seconds': timeline[0][0] if timeline else None,
                   'last_seconds': timeline[-1][0] if timeline else None}}
@@ -239,9 +259,22 @@ def filter_local_rows(rows, image_dir, *, connection=None, browser_path=None,
             if key not in memo:
                 memo[key] = visual_descriptor(cdp, (image_dir/f'{key:04d}.jpg').read_bytes())
             return memo[key]
-        return filter_plan(rows, get, subtitle_rows=subtitle_rows, mode=mode, start=start, end=end)
+        references, detection = [], {'status': 'disabled', 'reference_orders': []}
+        if mode == 'auto':
+            print('正在分析整段课程的画面，并用 Windows 本机文字识别确认录播默认页…', flush=True)
 
-    if connection is not None or mode == 'off' or len(rows) < 12:
+            def read_text(representatives):
+                print(f'本机文字识别：核对 {len(representatives)} 组画面；不上传图片。', flush=True)
+                return read_image_text([image_dir/f"{row['order']:04d}.jpg" for row in representatives])
+
+            references, detection = default_page_references(rows, get, read_text)
+            if detection['status'] == 'unavailable':
+                print('本机文字识别不可用，未确认的页面将保留；可查看筛选报告。', flush=True)
+        return filter_plan(rows, get, subtitle_rows=subtitle_rows, mode=mode, start=start, end=end,
+                           default_reference_orders=references, detection=detection)
+
+    image_dir = Path(image_dir)
+    if connection is not None or mode == 'off':
         return run(connection)
     with local_image_browser(browser_path) as cdp:
         return run(cdp)

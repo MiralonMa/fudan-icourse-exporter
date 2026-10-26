@@ -65,12 +65,12 @@ class PPTTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(ppt, 'fetch_jpeg', side_effect=[JPEG, browser.ExportError('synthetic network failure')]):
                 with self.assertRaises(browser.ExportError):
-                    ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0)
+                    ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0, filter_mode='off')
             self.assertEqual(len(list(Path(directory).rglob('*.pdf'))), 0)
             manifest = next(Path(directory).rglob('PPT清单.json'))
             self.assertEqual(json.loads(manifest.read_text(encoding='utf-8'))['missing_orders'], [2])
             with patch.object(ppt, 'fetch_jpeg', return_value=JPEG) as fetch:
-                target, result = ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0)
+                target, result = ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0, filter_mode='off')
                 self.assertEqual(fetch.call_count, 1)
                 self.assertEqual(result['missing_orders'], [])
                 self.assertTrue(target.is_file())
@@ -78,7 +78,7 @@ class PPTTests(unittest.TestCase):
             (manifest.parent/'images/0001.jpg').write_bytes(b'broken')
             with patch.object(ppt, 'fetch_jpeg', side_effect=browser.ExportError('synthetic offline')):
                 with self.assertRaises(browser.ExportError):
-                    ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0)
+                    ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0, filter_mode='off')
             checkpoint = json.loads(manifest.read_text(encoding='utf-8'))
             self.assertEqual([r['order'] for r in checkpoint['completed']], [2])
             self.assertEqual(checkpoint['missing_orders'], [1])
@@ -86,10 +86,30 @@ class PPTTests(unittest.TestCase):
     def test_partial_is_explicit_and_labelled(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(ppt, 'fetch_jpeg', side_effect=[JPEG, browser.ExportError('synthetic failure')]):
-                target, result = ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0, allow_partial=True)
+                target, result = ppt.export_ppt(None, sample(), directory, min_width=1, min_height=1, retries=0, allow_partial=True, filter_mode='off')
             self.assertIn('部分1张_共2张', target.name)
             self.assertEqual(result['missing_orders'], [2])
             self.assertEqual(target.read_bytes().count(JPEG), 1)
+
+    def test_shared_folder_rejects_changed_course_or_picture_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)/'synthetic-course'
+            with patch.object(ppt, 'fetch_jpeg', return_value=JPEG):
+                target, _ = ppt.export_ppt(None, sample(), directory, course_folder=folder,
+                    min_width=1, min_height=1, retries=0, filter_mode='off')
+            original_pdf = target.read_bytes()
+            original_manifest = (folder/'PPT清单.json').read_bytes()
+            for case in ('url', 'slides'):
+                changed = sample()
+                if case == 'url': changed['url'] += '&sub_id=1'
+                else: changed['rows'][1]['time'] = '00:00:02'
+                with self.subTest(case=case), patch.object(ppt, 'fetch_jpeg') as fetch:
+                    with self.assertRaisesRegex(browser.ExportError, '不同课程或不同图片清单'):
+                        ppt.export_ppt(None, changed, directory, course_folder=folder,
+                            min_width=1, min_height=1, filter_mode='off')
+                    fetch.assert_not_called()
+                self.assertEqual(target.read_bytes(), original_pdf)
+                self.assertEqual((folder/'PPT清单.json').read_bytes(), original_manifest)
 
     @unittest.skipUnless(os.environ.get('RUN_BROWSER_TESTS') == '1', 'opt-in local browser integration')
     def test_real_browser_fetch_and_original_size_gate(self):
@@ -136,7 +156,7 @@ class PPTTests(unittest.TestCase):
                         rows = ppt.prepare_slides(data)
                         with self.assertRaises(browser.ExportError):
                             ppt.fetch_jpeg(cdp, rows[0]['original'])  # default gate rejects thumbnails
-                        target, report = ppt.export_ppt(cdp, data, Path(directory)/'exports', min_width=1, min_height=1, retries=0)
+                        target, report = ppt.export_ppt(cdp, data, Path(directory)/'exports', min_width=1, min_height=1, retries=0, filter_mode='off')
                     self.assertEqual(len(report['completed']), 2)
                     self.assertEqual(target.read_bytes().count(JPEG), 2)
                     for image in target.parent.glob('images/*.jpg'):

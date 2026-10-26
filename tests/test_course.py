@@ -49,7 +49,8 @@ class CourseTests(unittest.TestCase):
             ppt.assert_not_called()
             self.assertFalse(errors)
             self.assertEqual(set(succeeded), {'subtitles'})
-            self.assertEqual(succeeded['subtitles'].parent.name, '字幕')
+            self.assertTrue(succeeded['subtitles'].parent.name.startswith('合成双选测试_'))
+            self.assertEqual(succeeded['subtitles'].parent.parent, Path(directory))
             self.assertIn('合成示例二。', succeeded['subtitles'].read_text(encoding='utf-8-sig'))
 
     def test_ppt_only_does_not_read_subtitles(self):
@@ -59,6 +60,24 @@ class CourseTests(unittest.TestCase):
             read_subtitles.assert_not_called()
             self.assertFalse(errors)
             self.assertEqual(set(succeeded), {'ppt'})
+
+    def test_course_folder_is_shared_across_separate_choices_and_title_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = course.course_folder(options(Path(directory)), subtitle_sample())
+            first.mkdir()
+            other_title = dict(subtitle_sample(), title='临时页面标题')
+            second = course.course_folder(options(Path(directory)), other_title)
+            self.assertEqual(first, second)
+            another = dict(subtitle_sample(), url=URL.replace('sub_id=0', 'sub_id=1'))
+            self.assertNotEqual(first, course.course_folder(options(Path(directory)), another))
+
+    def test_both_exports_are_passed_the_same_directory(self):
+        with tempfile.TemporaryDirectory() as directory, patch('sys.stdout', new=io.StringIO()):
+            config = options(Path(directory))
+            with patch.object(course.subtitles, 'extract_page', return_value=subtitle_sample()), patch.object(course.subtitles, 'CDP'), patch.object(course.ppt, 'evaluate', return_value=subtitle_sample()), patch.object(course.ppt, 'export_ppt', return_value=(Path(directory)/'synthetic.pdf', {'missing_orders': [], 'source_count': 2})) as export:
+                succeeded, errors = course.run_pending(TARGET, ('subtitles', 'ppt'), config)
+            self.assertFalse(errors)
+            self.assertEqual(succeeded['subtitles'].parent, export.call_args.kwargs['course_folder'])
 
     def test_retry_only_failed_export_with_one_browser_session(self):
         sessions = []
@@ -160,12 +179,13 @@ class CourseTests(unittest.TestCase):
                         '--min-width', '1', '--min-height', '1', '--retries', '0', '--json'])
                 self.assertEqual(status, 0)
                 self.assertEqual(len(launches), 1)
-                text_files = list((Path(directory)/'字幕').glob('*.txt'))
+                text_files = list(Path(directory).rglob('*.txt'))
                 self.assertEqual(len(text_files), 1)
                 self.assertIn('[00:00:02] 合成示例二。', text_files[0].read_text(encoding='utf-8-sig'))
                 self.assertTrue(text_files[0].with_suffix('.json').is_file())
-                pdf_files = list((Path(directory)/'PPT').rglob('*.pdf'))
+                pdf_files = list(Path(directory).rglob('*.pdf'))
                 self.assertEqual(len(pdf_files), 1)
+                self.assertEqual(pdf_files[0].parent, text_files[0].parent)
                 self.assertEqual(pdf_files[0].read_bytes().count(JPEG), 2)
                 report = json.loads((pdf_files[0].parent/'PPT清单.json').read_text(encoding='utf-8'))
                 self.assertEqual(report['missing_orders'], [])

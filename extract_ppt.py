@@ -252,20 +252,25 @@ def write_pdf(path, title, rows, image_dir, total):
 
 
 def export_ppt(cdp, data, output_dir, *, min_width=800, min_height=450, retries=2, allow_partial=False,
-               filter_mode='auto', start_time=None, end_time=None):
+               filter_mode='auto', start_time=None, end_time=None, course_folder=None):
     filtering.validate_window(start_time, end_time)
     rows = prepare_slides(data)
     clean_rows = [{'order': row['order'], 'time': row['time'],
                    'original': asset_identity(row['original'])} for row in rows]
     identity = hashlib.sha256(json.dumps(clean_rows, sort_keys=True).encode()).hexdigest()[:10]
-    folder = Path(output_dir).expanduser().resolve() / (safe_name(data['title']) + '_' + identity)
+    folder = (Path(course_folder).expanduser().resolve() if course_folder is not None else
+              Path(output_dir).expanduser().resolve() / (safe_name(data['title']) + '_' + identity))
     images = folder / 'images'
     images.mkdir(parents=True, exist_ok=True)
     report_path = folder / 'PPT清单.json'
     previous = {}
     if report_path.is_file():
         try:
-            previous = {row['order']: row for row in json.loads(report_path.read_text(encoding='utf-8')).get('completed', [])}
+            prior = json.loads(report_path.read_text(encoding='utf-8'))
+            if (prior.get('source_url') != sanitized_source_url(data['url'])
+                    or prior.get('slides') != clean_rows):
+                raise ExportError('目录中已有不同课程或不同图片清单；请指定新的 --output-dir，避免混用原图缓存。')
+            previous = {row['order']: row for row in prior.get('completed', [])}
         except (OSError, ValueError, KeyError):
             previous = {}
     report = {'title': data['title'], 'source_url': sanitized_source_url(data['url']),
@@ -336,7 +341,7 @@ def export_ppt(cdp, data, output_dir, *, min_width=800, min_height=450, retries=
     if not completed:
         raise ExportError('没有成功保存任何原图，未生成 PDF。')
     selected = [row for row in rows if row['order'] in completed]
-    print('正在核对头尾重复画面与时间轴…', flush=True)
+    print('正在筛选整段课程的录播默认页面并核对时间轴…', flush=True)
     selected, filter_report = filtering.filter_local_rows(selected, images, connection=cdp,
         subtitle_rows=data.get('subtitleTimeline', []), mode=filter_mode, start=start_time, end=end_time)
     report['filter'] = filter_report
@@ -366,7 +371,7 @@ def main(argv=None):
     parser.add_argument('--min-width', type=int, default=800, help='原图最小宽度，默认 800 像素')
     parser.add_argument('--min-height', type=int, default=450, help='原图最小高度，默认 450 像素')
     parser.add_argument('--allow-partial', action='store_true', help='显式允许输出标为“部分”的缺页 PDF')
-    parser.add_argument('--ppt-filter', choices=['auto', 'off'], default='auto', help='默认筛除头尾密集重复画面；off 保留全部画面')
+    parser.add_argument('--ppt-filter', choices=['auto', 'off'], default='auto', help='默认筛除整段课程中的录播默认页面（含课间）；off 保留全部画面')
     parser.add_argument('--start-time', help='PPT 手动开始时间 HH:MM:SS，保留跨越开始点的页面')
     parser.add_argument('--end-time', help='PPT 手动结束时间 HH:MM:SS')
     args = parser.parse_args(argv)

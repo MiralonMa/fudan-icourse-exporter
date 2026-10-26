@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import hashlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -77,7 +78,7 @@ def run_pending(target, pending, options):
                 data = subtitles.extract_page(target)
                 if subtitles.sanitized_source_url(data.get('url', '')) != expected:
                     raise subtitles.ExportError('录播页已切换，请回到本次选择的课程后重试。')
-                path = subtitles.save_subtitles(data, options.output_dir / '字幕', options.json)
+                path = subtitles.save_subtitles(data, course_folder(options, data), options.json)
                 print(f"字幕完成：{len(data['rows'])} 条，{data['rows'][0]['time']} - {data['rows'][-1]['time']}")
                 print('请核对末条时间是否覆盖所需课程，原始识别错误将保留。')
             else:
@@ -85,7 +86,8 @@ def run_pending(target, pending, options):
                     data = ppt.evaluate(cdp, ppt.SLIDES_JS)
                     if subtitles.sanitized_source_url(data.get('url', '')) != expected:
                         raise subtitles.ExportError('录播页已切换，请回到本次选择的课程后重试。')
-                    path, report = ppt.export_ppt(cdp, data, options.output_dir / 'PPT',
+                    path, report = ppt.export_ppt(cdp, data, options.output_dir,
+                        course_folder=course_folder(options, data),
                         min_width=options.min_width, min_height=options.min_height,
                         retries=options.retries, allow_partial=options.allow_partial,
                         filter_mode=options.ppt_filter, start_time=options.start_time, end_time=options.end_time)
@@ -102,6 +104,23 @@ def run_pending(target, pending, options):
     return succeeded, errors
 
 
+def course_folder(options, data):
+    """One directory per recording URL, shared across selections and retries."""
+    identity = subtitles.sanitized_source_url(data.get('url', ''))
+    if not identity:
+        raise subtitles.ExportError('无法确认课程来源，未创建课程目录。')
+    if not hasattr(options, '_course_folders'):
+        options._course_folders = {}
+    if identity not in options._course_folders:
+        key = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:10]
+        name = subtitles.safe_name(data.get('title', '课程录播')) + '_' + key
+        existing = [path for path in options.output_dir.glob('*_' + key) if path.is_dir()]
+        if len(existing) > 1:
+            raise subtitles.ExportError('发现同一课程的多个目录，请先统一目录或指定新的 --output-dir。')
+        options._course_folders[identity] = existing[0] if existing else options.output_dir / name
+    return options._course_folders[identity]
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description='复旦 icourse 字幕与清晰 PPT 本地提取：选择字幕、PPT 或两者，共用一次手动登录。')
@@ -114,7 +133,7 @@ def build_parser():
     parser.add_argument('--min-width', type=int, default=800, help='PPT 原图最小宽度，默认 800 像素')
     parser.add_argument('--min-height', type=int, default=450, help='PPT 原图最小高度，默认 450 像素')
     parser.add_argument('--allow-partial', action='store_true', help='明确允许输出标为“部分”的缺页 PPT PDF')
-    parser.add_argument('--ppt-filter', choices=['auto', 'off'], default='auto', help='自动筛除头尾密集重复画面；off 关闭自动筛选')
+    parser.add_argument('--ppt-filter', choices=['auto', 'off'], default='auto', help='本机识别并筛除整段课程中的录播默认页面（含课间）；off 关闭自动筛选')
     parser.add_argument('--start-time', help='PPT 手动开始时间 HH:MM:SS')
     parser.add_argument('--end-time', help='PPT 手动结束时间 HH:MM:SS')
     parser.add_argument('--filter-existing', type=Path, help='离线重建已下载 PPT；指定含 PPT清单.json 和 images 的文件夹，不需登录')

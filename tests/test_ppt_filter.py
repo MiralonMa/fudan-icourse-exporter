@@ -30,7 +30,7 @@ def features(row):
 
 class FilterTests(unittest.TestCase):
     def test_dense_matching_edges_removed_and_lecture_retained(self):
-        selected, report = filtering.filter_plan(dense_sample(), features)
+        selected, report = filtering.filter_plan(dense_sample(), features, default_reference_orders=[1])
         self.assertEqual([row['order'] for row in selected], list(range(6, 11)))
         self.assertEqual(len(report['excluded_orders']), 10)
 
@@ -44,7 +44,7 @@ class FilterTests(unittest.TestCase):
                 'originalResources': [prefix+'1000.jpg']}
         def plan(rows, image_dir, **kwargs):
             self.assertEqual(kwargs['mode'], 'auto')
-            return filtering.filter_plan(rows, features)
+            return filtering.filter_plan(rows, features, default_reference_orders=[1])
         original_writer = ppt.write_pdf
         with tempfile.TemporaryDirectory() as directory, patch('sys.stdout', new=io.StringIO()):
             with patch.object(ppt, 'fetch_jpeg', return_value=JPEG), patch.object(filtering, 'filter_local_rows', side_effect=plan), patch.object(ppt, 'write_pdf', wraps=original_writer) as writer:
@@ -56,15 +56,17 @@ class FilterTests(unittest.TestCase):
             self.assertEqual(len(list(Path(directory).rglob('*.pdf'))), 1)
             self.assertEqual(len(list(Path(directory).rglob('*.jpg'))), 15)
 
-    def test_interior_repeat_is_retained(self):
+    def test_confirmed_default_page_is_also_removed_in_middle(self):
         def mixed(row):
             return bytes([100]*48) if row['order'] == 8 else features(row)
-        selected, _ = filtering.filter_plan(dense_sample(), mixed)
-        self.assertIn(8, [row['order'] for row in selected])
+        selected, _ = filtering.filter_plan(dense_sample(), mixed, default_reference_orders=[1])
+        self.assertNotIn(8, [row['order'] for row in selected])
+        self.assertEqual([row['order'] for row in selected], [6, 7, 9, 10])
 
     def test_speech_on_background_is_evidence_not_a_global_time_cut(self):
         timeline = [{'time': row['time'], 'chars': 20} for row in dense_sample()]
-        selected, report = filtering.filter_plan(dense_sample(), features, subtitle_rows=timeline)
+        selected, report = filtering.filter_plan(dense_sample(), features, subtitle_rows=timeline,
+                                                  default_reference_orders=[1])
         self.assertEqual(len(selected), 5)
         self.assertEqual(report['subtitle_timeline']['count'], 15)
         self.assertEqual(report['pages'][-1]['subtitle_count'], 1)
@@ -83,6 +85,61 @@ class FilterTests(unittest.TestCase):
     def test_different_start_and_end_keep_all(self):
         selected, _ = filtering.filter_plan(dense_sample(), lambda row: bytes([row['order']*10]*48))
         self.assertEqual(len(selected), 15)
+
+    def test_repetition_without_semantic_confirmation_keeps_all(self):
+        selected, report = filtering.filter_plan(dense_sample(), features)
+        self.assertEqual(len(selected), 15)
+        self.assertFalse(report['excluded_orders'])
+
+    def test_default_majority_does_not_disable_filtering(self):
+        rows = rows_at(list(range(0, 300, 5)))
+        def majority(row):
+            return bytes([100]*48) if row['order'] != 30 else bytes([220]*48)
+        selected, report = filtering.filter_plan(rows, majority, default_reference_orders=[1])
+        self.assertEqual([row['order'] for row in selected], [30])
+        self.assertEqual(report['automatic_excluded_count'], 59)
+
+    def test_only_default_pages_does_not_create_empty_pdf(self):
+        with self.assertRaisesRegex(ExportError, '没有课程页面'):
+            filtering.filter_plan(rows_at([0, 5]), lambda _: bytes([100]*48),
+                                  default_reference_orders=[1])
+
+    def test_text_confirmation_requires_multiple_recording_guide_markers(self):
+        positive = '本 科 课 程 评 教 提 醒\n录 制 操 作 演 示\n教 室 分 布\n视频获取及注意事项'
+        self.assertTrue(filtering.is_default_page_text(positive))
+        self.assertTrue(filtering.is_default_page_text('cfd.fudan.edu 录制操作演示 视频获取'))
+        for text in ('', '录制操作演示', '课程讲义 教室分布 录制操作演示',
+                     '智慧教学资源平台', 'icourse.fudan.edu 课程知识点'):
+            with self.subTest(text=text):
+                self.assertFalse(filtering.is_default_page_text(text))
+
+    def test_group_ocr_is_required_and_includes_singletons(self):
+        def read(representatives):
+            self.assertEqual([row['order'] for row in representatives], [1, 6])
+            return ['录制操作演示 视频获取 本科课程评教提醒', '普通课程封面']
+        references, detection = filtering.default_page_references(dense_sample(), features, read)
+        self.assertEqual(references, [1])
+        self.assertEqual(detection['visual_groups'], 2)
+        self.assertEqual(detection['status'], 'complete')
+        rows = rows_at([0, 5])
+        refs, result = filtering.default_page_references(rows,
+            lambda row: bytes([row['order']*100]*48), lambda _: [None, '普通课件'])
+        self.assertFalse(refs)
+        self.assertEqual(result['ocr_failed_groups'], 1)
+
+    def test_unavailable_local_ocr_keeps_unconfirmed_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for row in dense_sample():
+                (Path(directory)/f"{row['order']:04d}.jpg").write_bytes(JPEG)
+            with patch.object(filtering, 'visual_descriptor', return_value=bytes([100]*48)), patch.object(filtering, 'read_image_text', side_effect=OSError('Unavailable')), patch('sys.stdout', new=io.StringIO()):
+                selected, report = filtering.filter_local_rows(dense_sample(), Path(directory), connection=object())
+            self.assertEqual(len(selected), 15)
+            self.assertEqual(report['default_page_detection']['status'], 'unavailable')
+
+    def test_image_read_failure_is_not_disguised_as_missing_ocr(self):
+        with patch.object(filtering, 'visual_descriptor', side_effect=OSError('Image failure')):
+            with self.assertRaises(OSError):
+                filtering.filter_local_rows(rows_at([0]), Path('missing-images'), connection=object())
 
     def test_off_mode_never_reads_pixels(self):
         def forbidden(_):
@@ -147,6 +204,33 @@ class FilterTests(unittest.TestCase):
             second = filtering.visual_descriptor(connection, JPEG)
         self.assertEqual(len(first), 48*27*3)
         self.assertEqual(filtering.distance(first, second), 0)
+
+    @unittest.skipUnless(os.name == 'nt' and os.environ.get('RUN_BROWSER_TESTS') == '1',
+                         'opt-in Windows local OCR integration')
+    def test_windows_ocr_reads_browser_generated_local_image(self):
+        # Large synthetic text image, created offline without image packages.
+        with tempfile.TemporaryDirectory() as directory:
+            with filtering.local_image_browser() as connection:
+                expression = r'''(async () => {
+                  const canvas = new OffscreenCanvas(1280, 720);
+                  const ctx = canvas.getContext('2d');
+                  ctx.fillStyle = 'white'; ctx.fillRect(0, 0, 1280, 720);
+                  ctx.fillStyle = 'black'; ctx.font = '40px Arial';
+                  ctx.fillText('Synthetic local OCR integration test', 40, 100);
+                  const blob = await canvas.convertToBlob({type:'image/jpeg'});
+                  const bytes = new Uint8Array(await blob.arrayBuffer());
+                  let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte);
+                  return btoa(binary);
+                })()'''
+                result = connection.call('Runtime.evaluate', {'expression': expression,
+                    'awaitPromise': True, 'returnByValue': True})
+            import base64
+            image = Path(directory)/'synthetic.jpg'
+            image.write_bytes(base64.b64decode(result['result']['value']))
+            texts = filtering.read_image_text([image])
+            self.assertEqual(len(texts), 1)
+            self.assertIsInstance(texts[0], str)
+            self.assertIn('synthetic', texts[0].replace(' ', '').casefold())
 
 
 if __name__ == '__main__':
