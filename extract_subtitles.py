@@ -228,7 +228,10 @@ def find_browser(explicit=None):
 
 def launch_browser(browser, profile, url, headless=False):
     command = [browser, '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
-               '--user-data-dir=' + str(profile), '--no-first-run', '--no-default-browser-check']
+               '--user-data-dir=' + str(profile), '--no-first-run', '--no-default-browser-check',
+               # Fresh profiles can discover external extensions and open their
+               # installation tabs. The exporter needs no browser extensions.
+               '--disable-extensions', '--disable-sync']
     if headless:
         command += ['--headless=new', '--disable-gpu']
     command.append(url)
